@@ -135,7 +135,6 @@ class TalkingHead {
       lipsyncLang: 'fi',
       lipsyncModules: ['fi', 'en', 'lt'],
       pcmSampleRate: 22050,
-      audioCtx: null,
       modelRoot: "Armature",
       modelPixelRatio: 1,
       modelFPS: 30,
@@ -954,28 +953,27 @@ class TalkingHead {
   * @param {number} sampleRate
   */
   initAudioGraph(sampleRate = null) {
-    // Audio context
-    if (this.opt.audioCtx && this.audioCtx.state !== 'closed') {
+    // [Patch] DoaCam Safari Fix (Upstream Candidate):
+    // If we have a valid external context, we MUST reuse it to preserve the user gesture (running state).
+    // Closing it and creating a new one (even with specific sampleRate) causes a 'suspended' state on iOS/Safari.
+    const useExternal = this.opt.audioCtx && this.opt.audioCtx.state !== 'closed';
 
-      // Use the given audio context
+    if (useExternal) {
       if (this.audioCtx !== this.opt.audioCtx) {
         this.audioCtx = this.opt.audioCtx;
       }
-
+      // If already assigned, do nothing (Protect from reset)
     } else {
-
-      // Close existing context if it exists
+      // Standard internal behavior
       if (this.audioCtx && this.audioCtx.state !== 'closed') {
         this.audioCtx.close();
       }
 
-      // Create a new context
       if (sampleRate) {
         this.audioCtx = new AudioContext({ sampleRate });
       } else {
         this.audioCtx = new AudioContext();
       }
-
     }
 
     // Create audio nodes
@@ -3544,6 +3542,9 @@ class TalkingHead {
         sr >= 8000 &&
         sr <= 96000
       ) {
+        // [DoaCam Patch] Store for worklet resampling (Safari fix: input may differ from output rate)
+        // See: /TALKINGHEAD_ISSUE_DRAFT.md for documentation
+        this.streamInputSampleRate = sr;
         if (sr !== this.audioCtx.sampleRate) {
           this.initAudioGraph(sr);
         }
@@ -3554,12 +3555,12 @@ class TalkingHead {
       }
     }
 
+    // [DoaCam Patch] Store input sample rate for worklet resampling
+    this.streamInputSampleRate = opt.sampleRate;
+
     if (opt.gain !== undefined) {
       this.audioStreamGainNode.gain.value = opt.gain;
     }
-
-    // [DoaCam Patch] Store input sample rate for worklet resampling
-    this.streamInputSampleRate = opt.sampleRate;
 
     // Check if we need to create or recreate the worklet
     const needsWorkletSetup = !this.streamWorkletNode ||
@@ -3594,6 +3595,9 @@ class TalkingHead {
 
       this.streamWorkletNode = new AudioWorkletNode(this.audioCtx, 'playback-worklet', {
         processorOptions: {
+          // [DoaCam Patch] Pass the INPUT sample rate (e.g., 24000 from Gemini) for proper resampling
+          // The worklet will interpolate to match the output/context sample rate (Safari fix)
+          // See: /TALKINGHEAD_ISSUE_DRAFT.md        processorOptions: {
           sampleRate: this.streamInputSampleRate || this.audioCtx.sampleRate,
           metrics: opt.metrics || { enabled: false }
         }
@@ -3643,12 +3647,15 @@ class TalkingHead {
     // If Web Audio API is suspended, try to resume it
     if (this.audioCtx.state === "suspended" || this.audioCtx.state === "interrupted") {
       const resume = this.audioCtx.resume();
-      const timeout = new Promise((_r, rej) => setTimeout(() => rej("p2"), 1000));
+      // Expanded timeout for Safari
+      const timeout = new Promise((_r, rej) => setTimeout(() => rej("p2"), 5000));
       try {
         await Promise.race([resume, timeout]);
       } catch (e) {
-        console.warn("Can't play audio. Web Audio API suspended. This is often due to calling some speak method before the first user action, which is typically prevented by the browser.");
-        return;
+        console.warn("Can't play audio. Web Audio API suspended. Proceeding anyway...");
+        // Do NOT return here. Allow streaming to set up even if audio is currently suspended.
+        // It might resume later when data arrives.
+        // return; 
       }
     }
   }
@@ -4308,7 +4315,7 @@ class TalkingHead {
   stop() {
     this.isRunning = false;
     // [DoaCam Fix] Don't suspend context if we are using an external one
-    // this.audioCtx.suspend(); 
+    // this.audioCtx.suspend();
   }
 
   /**
